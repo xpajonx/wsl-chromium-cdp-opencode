@@ -1,0 +1,14 @@
+{
+  "name": "wsl-chromium-cdp-opencode",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin for a dedicated WSL Chromium instance over loopback CDP",
+  "type": "module",
+  "license": "MIT",
+  "repository": "https://github.com/xpajonx/wsl-chromium-cdp-opencode.git",
+  "exports": "./src/wsl-chromium-cdp.ts",
+  "main": "./src/wsl-chromium-cdp.ts",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "eval": "node evals/package-contract.mjs"
+  }
+}

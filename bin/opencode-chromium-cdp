@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  printf 'Usage: %s [--headless] [URL]\n' "$0" >&2
+  exit 2
+}
+
+headless=0
+url=about:blank
+url_set=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --headless)
+      [ "$headless" -eq 0 ] || usage
+      headless=1
+      ;;
+    --help|-h)
+      usage
+      ;;
+    --*)
+      usage
+      ;;
+    *)
+      [ "$url_set" -eq 0 ] || usage
+      url=$1
+      url_set=1
+      ;;
+  esac
+  shift
+done
+
+chromium=/snap/bin/chromium
+profile=$HOME/.local/share/opencode-chromium-cdp
+endpoint=http://127.0.0.1:9222
+
+[ -x "$chromium" ] || { printf 'Chromium executable missing: %s\n' "$chromium" >&2; exit 1; }
+
+if ! command -v curl >/dev/null 2>&1; then
+  printf 'curl is required to check whether the CDP endpoint is already active.\n' >&2
+  exit 1
+fi
+
+if curl --silent --show-error --max-time 1 "$endpoint/json/version" >/dev/null 2>&1; then
+  printf 'CDP endpoint already active at %s; refusing to launch a second instance.\n' "$endpoint" >&2
+  exit 1
+fi
+
+if [ "$headless" -eq 1 ]; then
+  set -- --headless "$@"
+fi
+
+mkdir -p "$profile"
+exec "$chromium" "$@" \
+  --user-data-dir="$profile" \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --no-first-run \
+  --no-default-browser-check \
+  "$url"
