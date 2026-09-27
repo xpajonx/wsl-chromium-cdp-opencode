@@ -28,6 +28,7 @@ assert.deepEqual(packedFiles, [
   "package.json",
   "src/wsl-chromium-cdp.ts",
   "test/cdp-session.test.mjs",
+  "test/launcher-resolve.test.mjs",
   "test/plugin-registration.test.mjs",
   "test/target-cache.test.mjs",
 ].sort())
@@ -37,7 +38,12 @@ assert.match(readme, /127\.0\.0\.1:9222/)
 assert.match(readme, /unauthenticated/i)
 assert.match(readme, /any local process/i)
 assert.match(readme, /avoid sensitive logins/i)
+assert.match(readme, /WSL_CHROMIUM_CDP_BIN/)
+assert.match(readme, /Snap Chromium does not start under WSL2/)
 assert.match(readme, /Target identity can be stale for up to 500ms/)
 
+const launcher = readFileSync(path.join(root, "bin/opencode-chromium-cdp"), "utf8")
+assert.equal(launcher.includes("chromium=/snap/bin/chromium"), false)
+
 execFileSync("sh", ["-n", path.join(root, "bin/opencode-chromium-cdp")], { cwd: root, stdio: "pipe" })
-console.log("Package contract eval passed: export, exact package contents, CDP trust boundary, stale-target window, and launcher syntax.")
+console.log("Package contract eval passed: export, exact package contents, CDP trust boundary, stale-target window, browser resolution, and launcher syntax.")

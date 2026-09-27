@@ -18,7 +18,7 @@ mkdir -p ~/.local/bin
 install -m 755 wsl-chromium-cdp-opencode/bin/opencode-chromium-cdp ~/.local/bin/opencode-chromium-cdp
 ```
 
-Prerequisites: WSL2, Snap Chromium executable at `/snap/bin/chromium`, and `curl`. Ensure `~/.local/bin` is in `PATH`.
+Prerequisites: WSL2, a working Chromium or Chrome installation, and `curl`. The launcher searches `/opt/google/chrome/chrome`, `/usr/bin/google-chrome-stable`, `/usr/bin/chromium`, newest Playwright `chrome-linux64` builds, newest Playwright `chrome-linux` builds, then `/snap/bin/chromium`. Ensure `~/.local/bin` is in `PATH`.
 
 ## Start Chromium
 
@@ -27,6 +27,12 @@ opencode-chromium-cdp [--headless] [URL]
 ```
 
 For example, `opencode-chromium-cdp https://example.com`; use `--headless` to start headless Chromium. The launcher creates and reuses the dedicated profile at `~/.local/share/opencode-chromium-cdp`, binds CDP to loopback port 9222, and refuses to start a second instance when that endpoint is already active. It does not take over or terminate an existing browser. If it refuses, inspect the existing Chromium instance and stop it only if you have identified it as the instance you started. Do not kill an unknown process or delete the profile to recover.
+
+### Browser resolution
+
+The launcher probes each candidate with `--version` and skips candidates that are not executable or do not respond successfully. Set `WSL_CHROMIUM_CDP_BIN` to override the browser path. Run `opencode-chromium-cdp --resolve` to print the browser path that would be selected without launching it. A working Chromium or Chrome must be present; availability is not guaranteed.
+
+Snap Chromium does not start under WSL2: it can fail with `cannot preserve mount namespace ... Invalid argument`. `/usr/bin/chromium-browser` is a Snap wrapper and inherits the failure. The launcher tests candidates rather than assuming those paths work.
 
 ## Tools
 

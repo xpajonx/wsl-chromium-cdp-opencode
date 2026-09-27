@@ -2,11 +2,12 @@
 set -eu
 
 usage() {
-  printf 'Usage: %s [--headless] [URL]\n' "$0" >&2
+  printf 'Usage: %s [--headless] [--resolve] [URL]\n' "$0" >&2
   exit 2
 }
 
 headless=0
+resolve=0
 url=about:blank
 url_set=0
 while [ "$#" -gt 0 ]; do
@@ -14,6 +15,10 @@ while [ "$#" -gt 0 ]; do
     --headless)
       [ "$headless" -eq 0 ] || usage
       headless=1
+      ;;
+    --resolve)
+      [ "$resolve" -eq 0 ] || usage
+      resolve=1
       ;;
     --help|-h)
       usage
@@ -30,11 +35,72 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-chromium=/snap/bin/chromium
+if [ "$resolve" -eq 1 ] && [ "$url_set" -eq 1 ]; then
+  usage
+fi
+
+resolve_chromium() {
+  tried=""
+  reject_reasons=""
+  if [ "${WSL_CHROMIUM_CDP_CANDIDATES+x}" = x ]; then
+    candidates=$WSL_CHROMIUM_CDP_CANDIDATES
+    if [ "${WSL_CHROMIUM_CDP_BIN+x}" = x ] && [ -n "$WSL_CHROMIUM_CDP_BIN" ]; then
+      candidates="$WSL_CHROMIUM_CDP_BIN $candidates"
+    fi
+  else
+    candidates=""
+    if [ "${WSL_CHROMIUM_CDP_BIN+x}" = x ] && [ -n "$WSL_CHROMIUM_CDP_BIN" ]; then
+      candidates="$WSL_CHROMIUM_CDP_BIN"
+    fi
+    candidates="$candidates /opt/google/chrome/chrome /usr/bin/google-chrome-stable /usr/bin/chromium"
+    for browser_dir in $(ls -1d "$HOME"/.cache/ms-playwright/chromium-* 2>/dev/null | while read -r browser_read; do printf '%s %s\n' "${browser_read##*-}" "$browser_read"; done | sort -k1,1nr | cut -d' ' -f2-); do
+      for browser_sub in chrome-linux64/chrome chrome-linux/chrome; do
+        if [ -x "$browser_dir/$browser_sub" ]; then
+          candidates="$candidates $browser_dir/$browser_sub"
+        fi
+      done
+    done
+    candidates="$candidates /snap/bin/chromium"
+  fi
+
+  for candidate in $candidates; do
+    if [ -n "$tried" ]; then
+      tried="$tried
+  $candidate"
+    else
+      tried="  $candidate"
+    fi
+    if [ ! -x "$candidate" ]; then
+      reject_reasons="$reject_reasons\n  - $candidate: not executable"
+      continue
+    fi
+    if ! "$candidate" --version >/dev/null 2>&1; then
+      reject_reasons="$reject_reasons\n  - $candidate: --version probe failed"
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done
+
+  {
+    printf 'No working Chromium or Chrome was found. A working Chromium or Chrome is required.\n'
+    printf 'Set WSL_CHROMIUM_CDP_BIN to the path of your browser executable and retry.\n'
+    printf 'Candidates tried:\n'
+    if [ -n "$tried" ]; then printf '%s\n' "$tried"; else printf '  (none)\n'; fi
+    if [ -n "$reject_reasons" ]; then printf '%b\n' "$reject_reasons"; fi
+  } >&2
+  return 1
+}
+
+chromium=$(resolve_chromium) || exit 1
+if [ "$resolve" -eq 1 ]; then
+  printf '%s\n' "$chromium"
+  exit 0
+fi
+printf 'Using Chromium: %s\n' "$chromium" >&2
+
 profile=$HOME/.local/share/opencode-chromium-cdp
 endpoint=http://127.0.0.1:9222
-
-[ -x "$chromium" ] || { printf 'Chromium executable missing: %s\n' "$chromium" >&2; exit 1; }
 
 if ! command -v curl >/dev/null 2>&1; then
   printf 'curl is required to check whether the CDP endpoint is already active.\n' >&2
