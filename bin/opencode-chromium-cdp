@@ -42,47 +42,114 @@ fi
 resolve_chromium() {
   tried=""
   reject_reasons=""
+  override_note=""
+  # Append one candidate so the list stays newline separated from the start.
+  # No leading space and no space-joined entries, so the IFS='<newline>' loop
+  # below sees exactly one path per iteration.
+  append_candidate() {
+    if [ -z "$candidates" ]; then
+      candidates=$1
+    else
+      candidates="$candidates
+$1"
+    fi
+  }
   if [ "${WSL_CHROMIUM_CDP_CANDIDATES+x}" = x ]; then
-    candidates=$WSL_CHROMIUM_CDP_CANDIDATES
+    # An explicitly set override replaces the default list. Whitespace runs
+    # (spaces, tabs, CR, LF) separate candidates and become newlines, so
+    # pre-existing whitespace-separated values keep working unchanged.
+    candidates=$(printf '%s' "$WSL_CHROMIUM_CDP_CANDIDATES" | tr '\t\r\n\v\f' '    ' | tr -s ' ' '\n')
     if [ "${WSL_CHROMIUM_CDP_BIN+x}" = x ] && [ -n "$WSL_CHROMIUM_CDP_BIN" ]; then
-      candidates="$WSL_CHROMIUM_CDP_BIN $candidates"
+      candidates="$WSL_CHROMIUM_CDP_BIN
+$candidates"
     fi
   else
     candidates=""
     if [ "${WSL_CHROMIUM_CDP_BIN+x}" = x ] && [ -n "$WSL_CHROMIUM_CDP_BIN" ]; then
       candidates="$WSL_CHROMIUM_CDP_BIN"
     fi
-    candidates="$candidates /opt/google/chrome/chrome /usr/bin/google-chrome-stable /usr/bin/chromium"
+    append_candidate "/opt/google/chrome/chrome"
+    append_candidate "/usr/bin/google-chrome-stable"
+    append_candidate "/usr/bin/chromium"
     for browser_dir in $(ls -1d "$HOME"/.cache/ms-playwright/chromium-* 2>/dev/null | while read -r browser_read; do printf '%s %s\n' "${browser_read##*-}" "$browser_read"; done | sort -k1,1nr | cut -d' ' -f2-); do
       for browser_sub in chrome-linux64/chrome chrome-linux/chrome; do
         if [ -x "$browser_dir/$browser_sub" ]; then
-          candidates="$candidates $browser_dir/$browser_sub"
+          append_candidate "$browser_dir/$browser_sub"
         fi
       done
     done
-    candidates="$candidates /snap/bin/chromium"
+    append_candidate "/snap/bin/chromium"
   fi
 
+  # Candidate paths are newline separated and every expansion below is quoted,
+  # so a path containing spaces is probed as one path instead of being split
+  # into unrelated fragments.
+  old_ifs=$IFS
+  IFS='
+'
+  # shellcheck disable=SC2086
   for candidate in $candidates; do
-    if [ -n "$tried" ]; then
-      tried="$tried
+    IFS=$old_ifs
+    if [ -n "$(printf '%s' "$candidate" | tr -d '[:space:]')" ]; then
+      if [ -n "$tried" ]; then
+        tried="$tried
   $candidate"
-    else
-      tried="  $candidate"
+      else
+        tried="  $candidate"
+      fi
+      if [ ! -x "$candidate" ]; then
+        reject_reasons="$reject_reasons\n  - $candidate: not executable"
+        IFS='
+'
+        continue
+      fi
+      # A probe that never returns would hang the launcher, so cap it when a
+      # timeout(1) is available. Without one the probe runs directly and a
+      # hanging candidate can block the launcher indefinitely.
+      probe_timeout=""
+      if command -v gtimeout >/dev/null 2>&1; then
+        probe_timeout=gtimeout
+      elif command -v timeout >/dev/null 2>&1; then
+        probe_timeout=timeout
+      fi
+      if [ -n "$probe_timeout" ]; then
+        set +e
+        "$probe_timeout" 5 "$candidate" --version >/dev/null 2>&1
+        probe_status=$?
+        set -e
+        if [ "$probe_status" -ne 0 ]; then
+          if [ "$probe_status" -eq 124 ]; then
+            reject_reasons="$reject_reasons\n  - $candidate: probe timed out"
+          else
+            reject_reasons="$reject_reasons\n  - $candidate: --version probe failed"
+          fi
+          IFS='
+'
+          continue
+        fi
+      elif ! "$candidate" --version >/dev/null 2>&1; then
+        reject_reasons="$reject_reasons\n  - $candidate: --version probe failed"
+        IFS='
+'
+        continue
+      fi
+      printf '%s\n' "$candidate"
+      IFS=$old_ifs
+      return 0
     fi
-    if [ ! -x "$candidate" ]; then
-      reject_reasons="$reject_reasons\n  - $candidate: not executable"
-      continue
-    fi
-    if ! "$candidate" --version >/dev/null 2>&1; then
-      reject_reasons="$reject_reasons\n  - $candidate: --version probe failed"
-      continue
-    fi
-    printf '%s\n' "$candidate"
-    return 0
+    IFS='
+'
   done
+  IFS=$old_ifs
+
+  if [ -n "$(printf '%s' "$candidates" | tr -d '[:space:]')" ]; then
+    :
+  elif [ "${WSL_CHROMIUM_CDP_CANDIDATES+x}" = x ]; then
+    override_note='WSL_CHROMIUM_CDP_CANDIDATES is set but empty; the override suppressed the default candidate list, so no candidates remain. Unset it to restore the defaults.'
+  fi
 
   {
+    if [ -n "$override_note" ]; then printf '%s\n' "$override_note"; fi
     printf 'No working Chromium or Chrome was found. A working Chromium or Chrome is required.\n'
     printf 'Set WSL_CHROMIUM_CDP_BIN to the path of your browser executable and retry.\n'
     printf 'Candidates tried:\n'
