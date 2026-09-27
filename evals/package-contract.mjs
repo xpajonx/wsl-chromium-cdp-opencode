@@ -27,7 +27,9 @@ assert.deepEqual(packedFiles, [
   "evals/package-contract.mjs",
   "package.json",
   "src/wsl-chromium-cdp.ts",
+  "test/cdp-session.test.mjs",
   "test/plugin-registration.test.mjs",
+  "test/target-cache.test.mjs",
 ].sort())
 
 const readme = readFileSync(path.join(root, "README.md"), "utf8")
@@ -35,6 +37,7 @@ assert.match(readme, /127\.0\.0\.1:9222/)
 assert.match(readme, /unauthenticated/i)
 assert.match(readme, /any local process/i)
 assert.match(readme, /avoid sensitive logins/i)
+assert.match(readme, /Target identity can be stale for up to 500ms/)
 
 execFileSync("sh", ["-n", path.join(root, "bin/opencode-chromium-cdp")], { cwd: root, stdio: "pipe" })
-console.log("Package contract eval passed: export, exact package contents, CDP trust boundary, and launcher syntax.")
+console.log("Package contract eval passed: export, exact package contents, CDP trust boundary, stale-target window, and launcher syntax.")
