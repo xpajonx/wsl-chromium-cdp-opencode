@@ -2,6 +2,9 @@ const CDP_HTTP = "http://127.0.0.1:9222"
 const REQUEST_TIMEOUT_MS = 5000
 const PAGE_TEXT_LIMIT = 8000
 const CONTROL_LIMIT = 100
+// 4000 chars bounds a single CDP Input.insertText frame to roughly the longest real form field, so a runaway
+// text argument cannot push an unbounded payload down the WebSocket.
+const TYPE_TEXT_LIMIT = 4000
 const TARGET_CACHE_MS = 500
 const LIST_CACHE_MS = 2000
 
@@ -409,14 +412,19 @@ export default {
         input: {
           type: "object",
           properties: {
-            selector: { type: "string", description: "CSS selector for exactly one visible editable input." },
-            text: { type: "string", description: "Text to insert." },
+            selector: { type: "string", minLength: 1, description: "CSS selector for exactly one visible editable input." },
+            text: { type: "string", maxLength: TYPE_TEXT_LIMIT, description: "Text to insert, up to 4000 characters bounding a single CDP frame." },
             target_id: { type: "string", description: "Optional page target id." },
           },
           required: ["selector", "text"],
           additionalProperties: false,
         },
         async execute(input: { selector: string; text: string; target_id?: string }) {
+          // The schema above already rejects an empty selector and an over-long text at the runtime validator, so
+          // these guards only have to make the same bounds observable to a direct call and to offline tests. They
+          // sit before the target lookup so a rejected call never reaches CDP.
+          if (typeof input.selector !== "string" || input.selector.trim() === "") return structuredToolError("wsl_chromium_type requires a non-empty selector.")
+          if (typeof input.text === "string" && input.text.length > TYPE_TEXT_LIMIT) return structuredToolError(`wsl_chromium_type text exceeds the ${TYPE_TEXT_LIMIT} character cap.`)
           try {
             const page = await selectTargetCached(input.target_id)
             return await withSession(page, async (session) => {
@@ -439,17 +447,21 @@ export default {
         input: {
           type: "object",
           properties: {
-            selector: { type: "string", description: "CSS selector for exactly one visible button, role=button, or anchor." },
+            selector: { type: "string", minLength: 1, description: "CSS selector for exactly one visible button, role=button, or anchor." },
             target_id: { type: "string", description: "Optional page target id." },
           },
           required: ["selector"],
           additionalProperties: false,
         },
         async execute(input: { selector: string; target_id?: string }) {
+          // The schema above already rejects an empty selector at the runtime validator, so this guard only has to
+          // make the same bound observable to a direct call and to offline tests. It sits before the target lookup so
+          // a rejected call never reaches CDP.
+          if (typeof input.selector !== "string" || input.selector.trim() === "") return structuredToolError("wsl_chromium_click requires a non-empty selector.")
           try {
             const page = await selectTargetCached(input.target_id)
             return await withSession(page, async (session) => {
-                const matches = await evaluate(session, selectorExpression(input.selector, "click")) as { candidateCount: number; candidates: Array<{ disabled: boolean; x: number; y: number; width: number; height: number; text: string }> }
+              const matches = await evaluate(session, selectorExpression(input.selector, "click")) as { candidateCount: number; candidates: Array<{ disabled: boolean; x: number; y: number; width: number; height: number; text: string }> }
                 if (matches.candidateCount === 0) return structuredToolError("No visible button-like target matched selector.")
                 if (matches.candidateCount !== 1) return structuredToolError(`Selector matched ${matches.candidateCount} visible button-like targets; exactly one is required.`)
                 const chosen = matches.candidates[0]

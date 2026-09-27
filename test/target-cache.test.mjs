@@ -434,3 +434,54 @@ test("the three real navigate and evaluate failure messages stay distinguishable
   assert.equal(collected[1].message.includes("Page query failed:"), false)
   assert.equal(collected[2].message.includes("Page query failed:"), false)
 })
+
+// The three input bounds below are enforced twice: once by the declared input schema at the runtime validator, and
+// once by a guard at the top of execute. Only the guard is reachable offline, because these tests call execute
+// directly with the same stubs the other tests use. Each case therefore asserts two things: the message names the
+// bound that was violated, and the fetch counter stayed at zero, which proves no CDP target lookup ever happened.
+
+test("wsl_chromium_type rejects an empty selector before any CDP work", async () => {
+  setupFetch()
+  const tools = await registerTools()
+  const outcome = await tools.get("wsl_chromium_type").execute({ selector: "", text: "hello" })
+  const body = JSON.parse(outcome.content)
+  assert.equal(body.ok, false)
+  assert.equal(body.error, "wsl_chromium_type requires a non-empty selector.")
+  assert.equal(calls, 0)
+})
+
+test("wsl_chromium_type rejects text past the 4000 character cap before any CDP work", async () => {
+  setupFetch()
+  const tools = await registerTools()
+  const outcome = await tools.get("wsl_chromium_type").execute({ selector: "#name", text: "a".repeat(4001) })
+  const body = JSON.parse(outcome.content)
+  assert.equal(body.ok, false)
+  assert.equal(body.error, "wsl_chromium_type text exceeds the 4000 character cap.")
+  assert.equal(calls, 0)
+})
+
+test("wsl_chromium_click rejects a whitespace-only selector before any CDP work", async () => {
+  setupFetch()
+  const tools = await registerTools()
+  const outcome = await tools.get("wsl_chromium_click").execute({ selector: "   " })
+  const body = JSON.parse(outcome.content)
+  assert.equal(body.ok, false)
+  assert.equal(body.error, "wsl_chromium_click requires a non-empty selector.")
+  assert.equal(calls, 0)
+})
+
+// The declared schema is the first line of defense and the only one a direct execute call bypasses, so its bounds are
+// asserted from the registered tools alone. No browser, fetch, or WebSocket is needed to read a schema.
+test("the type and click schemas declare the same non-empty selector and text bounds", async () => {
+  setupFetch()
+  const tools = await registerTools()
+  const typeSchema = tools.get("wsl_chromium_type").input
+  const clickSchema = tools.get("wsl_chromium_click").input
+  assert.equal(typeSchema.properties.selector.minLength, 1)
+  assert.equal(typeSchema.properties.text.maxLength, 4000)
+  assert.equal(clickSchema.properties.selector.minLength, 1)
+  assert.equal(clickSchema.properties.selector.type, "string")
+  assert.equal(typeSchema.additionalProperties, false)
+  assert.equal(clickSchema.additionalProperties, false)
+  assert.equal(calls, 0)
+})
