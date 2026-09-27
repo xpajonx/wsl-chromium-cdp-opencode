@@ -4,3 +4,6 @@ node_modules/
 coverage/
 .DS_Store
 Thumbs.db
+
+# agent memory scratch dir: never commit or pack
+.oem/
