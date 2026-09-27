@@ -1,11 +1,51 @@
 import assert from "node:assert/strict"
 import { afterEach, test } from "node:test"
-import { invalidateTargetCache, selectTargetCached, targets } from "../src/wsl-chromium-cdp.ts"
+import { invalidateTargetCache, selectTargetCached, targets, withSession } from "../src/wsl-chromium-cdp.ts"
 import plugin from "../src/wsl-chromium-cdp.ts"
 
 const originalFetch = globalThis.fetch
 const originalNow = Date.now
 const originalWebSocket = globalThis.WebSocket
+
+// A CDP socket for the default stub target. Every command is answered with the frame the given factory builds
+// from the outgoing request id, so an evaluate, an enable, and an insertText can each be scripted independently.
+class FakeCdpSocket {
+  constructor(url) {
+    assert.equal(url, "ws://127.0.0.1:9222/devtools/page/page-1")
+    this.listeners = new Map()
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? []
+    listeners.push(listener)
+    this.listeners.set(type, listeners)
+    if (type === "open") queueMicrotask(() => listener())
+  }
+
+  send(frame) {
+    const request = JSON.parse(frame)
+    queueMicrotask(() => {
+      const message = this.reply(request)
+      for (const listener of this.listeners.get("message") ?? []) listener({ data: JSON.stringify(message) })
+    })
+  }
+
+  close() {}
+}
+
+// Answers every method with a bare success envelope, which is the shortest path to a Runtime.evaluate reply.
+function evaluatingSocket(runtimeResult) {
+  return class extends FakeCdpSocket {
+    reply(request) { return { id: request.id, result: request.method === "Runtime.evaluate" ? runtimeResult : {} } }
+  }
+}
+
+// Records every tool by name so one setup call can drive any subset of the seven tools.
+async function registerTools() {
+  const tools = new Map()
+  await plugin.setup({ tool: { transform: async (register) => register({ add: (tool) => { tools.set(tool.name, tool) } }) } })
+  return tools
+}
 
 let calls
 let payload
@@ -273,4 +313,124 @@ test("all seven tools register an own execute function", async () => {
     assert.equal(Object.hasOwn(tool, "execute"), true, `${tool.name} must own execute`)
     assert.equal(typeof tool.execute, "function", `${tool.name} execute must be a function`)
   }
+})
+
+// A frame that carries no result field at all is what a real CDP endpoint sends when a command produced no
+// envelope. openSession resolves the missing field to {}, so every caller that reads response.result sees
+// undefined and must treat that as a CDP-level fault rather than dereferencing a missing object.
+class ResultlessFrameSocket extends FakeCdpSocket {
+  reply(request) { return { id: request.id } }
+}
+
+test("a Runtime.evaluate reply with no result field rejects as an empty response", async () => {
+  setupFetch()
+  globalThis.WebSocket = ResultlessFrameSocket
+
+  // First prove the reachability claim directly: the session layer swallows the missing result into {}.
+  const page = await selectTargetCached()
+  const resolved = await withSession(page, (session) => session.send("Runtime.evaluate", { expression: "1", returnByValue: true }))
+  assert.deepEqual(resolved, {})
+
+  // Then observe the real failure surface. evaluate() is module-private, so the only reachable proof of the
+  // thrown message is the tool that wraps it, and wsl_chromium_controls evaluates exactly once.
+  const tools = await registerTools()
+  const outcome = await tools.get("wsl_chromium_controls").execute({})
+
+  assert.equal(outcome.content.startsWith("Browser operation failed: "), true)
+  assert.equal(outcome.content.replace("Browser operation failed: ", ""), "Page query failed: empty response")
+})
+
+test("an Uncaught exception surfaces the description instead of the bare word", async () => {
+  setupFetch()
+  const tools = await registerTools()
+  const controls = tools.get("wsl_chromium_controls")
+
+  // Chromium reports a page-thrown exception as text "Uncaught" plus a stack-bearing description. Falling back to
+  // the verbatim text would report both cases as the bare word "Uncaught" and hide the actual cause.
+  globalThis.WebSocket = evaluatingSocket({
+    exceptionDetails: { text: "Uncaught", exception: { description: "SyntaxError: Unexpected identifier 'x'" } },
+  })
+  const surfaced = await controls.execute({})
+  assert.equal(surfaced.content.replace("Browser operation failed: ", ""), "Page query failed: SyntaxError: Unexpected identifier 'x'")
+
+  // A long description is bounded, so a huge page stack cannot flood the tool result.
+  const longDescription = `SyntaxError: ${"z".repeat(500)}`
+  invalidateTargetCache()
+  globalThis.WebSocket = evaluatingSocket({
+    exceptionDetails: { text: "Uncaught", exception: { description: longDescription } },
+  })
+  const bounded = (await controls.execute({})).content.replace("Browser operation failed: ", "")
+  const prefix = "Page query failed: "
+  assert.equal(bounded.startsWith(prefix), true)
+  assert.equal(bounded.slice(prefix.length), longDescription.slice(0, 300))
+  assert.equal(bounded.slice(prefix.length).length, 300)
+})
+
+test("a 200 status with a null /json/version body reports unexpected data, not a TypeError", async () => {
+  setupFetch()
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "http://127.0.0.1:9222/json/version")
+    return { ok: true, status: 200, json: async () => null }
+  }
+
+  const tools = await registerTools()
+  const outcome = await tools.get("wsl_chromium_status").execute()
+
+  assert.equal(outcome.content.includes("unexpected data"), true)
+  assert.equal(outcome.content.includes("TypeError"), false)
+})
+
+test("the three real navigate and evaluate failure messages stay distinguishable", async () => {
+  const collected = []
+
+  // 1. An empty evaluate response, surfaced through the controls tool.
+  setupFetch()
+  globalThis.WebSocket = ResultlessFrameSocket
+  const tools = await registerTools()
+  collected.push({
+    label: "empty response",
+    marker: "Page query failed:",
+    message: (await tools.get("wsl_chromium_controls").execute({})).content,
+  })
+
+  // 2. A target that vanished from the list: two consecutive misses against a non-empty fresh list prove it.
+  invalidateTargetCache()
+  setupFetch()
+  globalThis.WebSocket = NavigatingWebSocket
+  let served = 0
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "http://127.0.0.1:9222/json/list")
+    served += 1
+    const survivor = { id: "page-2", title: "Second", url: "https://example.org", type: "page", webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/page-2" }
+    const list = served === 1
+      ? [{ id: "page-1", title: "First", url: "https://example.com", type: "page", webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/page-1" }, survivor]
+      : [survivor]
+    return { ok: true, status: 200, json: async () => list }
+  }
+  collected.push({
+    label: "vanished target",
+    marker: "is no longer present in the CDP target list",
+    message: (await tools.get("wsl_chromium_navigate").execute({ url: "https://example.com/destination" })).content,
+  })
+
+  // 3. A target that never settles, so the poll loop reaches its deadline instead of matching the destination.
+  invalidateTargetCache()
+  setupFetch()
+  globalThis.WebSocket = NavigatingWebSocket
+  Date.now = (() => { let value = now; return () => (value += 2000) })()
+  collected.push({
+    label: "poll deadline",
+    marker: "did not settle before",
+    message: (await tools.get("wsl_chromium_navigate").execute({ url: "https://example.com/destination" })).content,
+  })
+
+  for (const entry of collected) {
+    assert.ok(entry.message.includes(entry.marker), `${entry.label} message must contain ${entry.marker}, got: ${entry.message}`)
+  }
+  assert.equal(new Set(collected.map((entry) => entry.marker)).size, 3)
+  assert.equal(new Set(collected.map((entry) => entry.message)).size, 3)
+  // The empty-response prefix is unique to the evaluate path; neither navigate failure may borrow it.
+  assert.equal(collected[0].message.startsWith("Browser operation failed: Page query failed:"), true)
+  assert.equal(collected[1].message.includes("Page query failed:"), false)
+  assert.equal(collected[2].message.includes("Page query failed:"), false)
 })

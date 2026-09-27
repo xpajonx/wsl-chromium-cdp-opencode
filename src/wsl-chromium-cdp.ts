@@ -187,15 +187,35 @@ function errorResult(error: unknown) {
   return result(`Browser operation failed: ${error instanceof Error ? error.message : String(error)}`)
 }
 
+// A missing or null response.result is a CDP-level fault (an evaluation that produced no envelope at all), not a
+// page fault, so it is reported here rather than at each of the four call sites. Callers therefore never see
+// undefined: they either get a value or get a "Page query failed:" error, which keeps the failure attributable.
+// CDP places exceptionDetails as a sibling of result, not inside it; the nested read is kept only so existing fakes
+// that still nest the field keep working.
+function exceptionText(details: { text?: string; exception?: { description?: string } }): string {
+  const text = details.text
+  if (typeof text === "string" && text !== "" && text !== "Uncaught") return text
+  // Chromium reports a page-thrown exception as text "Uncaught" plus a stack-bearing description, and a malformed
+  // argument such as an invalid CSS selector as text "Uncaught" with no description at all. Falling back to the
+  // verbatim text would report both as the bare word "Uncaught" and hide the actual cause, so prefer the
+  // description when one exists. Bounded to the same 300-char per-text cap the generated expressions apply.
+  const description = details.exception?.description
+  if (typeof description === "string" && description !== "") return description.slice(0, 300)
+  return "JavaScript exception"
+}
+
 async function evaluate(session: CdpSession, expression: string): Promise<unknown> {
-  const response = await session.send("Runtime.evaluate", {
+  const envelope = await session.send("Runtime.evaluate", {
     expression,
     returnByValue: true,
     awaitPromise: true,
   })
-  const resultValue = response.result as { value?: unknown; exceptionDetails?: { text?: string } } | undefined
-  if (resultValue?.exceptionDetails) throw new Error(`Page query failed: ${resultValue.exceptionDetails.text ?? "JavaScript exception"}`)
-  return resultValue?.value
+  const resultValue = envelope.result as { value?: unknown; exceptionDetails?: { text?: string; exception?: { description?: string } } } | undefined
+  const details = envelope.exceptionDetails as { text?: string; exception?: { description?: string } } | undefined
+    ?? resultValue?.exceptionDetails
+  if (details) throw new Error(`Page query failed: ${exceptionText(details)}`)
+  if (resultValue === undefined || resultValue === null) throw new Error("Page query failed: empty response")
+  return resultValue.value
 }
 
 function selectorExpression(selector: string, mode: "type" | "click") {
@@ -250,8 +270,12 @@ export default {
           try {
             const response = await boundedFetch(`${CDP_HTTP}/json/version`)
             if (!response.ok) return result(`CDP responded with HTTP ${response.status}`)
-            const info = await response.json() as { Browser?: string }
-            return result(`Connected to ${info.Browser ?? "Chromium"} at ${CDP_HTTP}`)
+            const info = await response.json() as { Browser?: string } | null
+            // Anything that is not an object with an optional string Browser (null, a JSON scalar, an array) makes
+            // the property read below meaningless, so it is reported as a data fault instead of surfacing as a
+            // TypeError property read on null inside the catch below.
+            if (!info || typeof info !== "object" || Array.isArray(info)) return result("CDP responded with unexpected data")
+            return result(`Connected to ${typeof info.Browser === "string" ? info.Browser : "Chromium"} at ${CDP_HTTP}`)
           } catch (error) { return errorResult(error) }
         },
       })
