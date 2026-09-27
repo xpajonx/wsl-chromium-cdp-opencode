@@ -145,7 +145,10 @@ function requireExecutable(file) {
 function hasTimeout() {
   return ["gtimeout", "timeout"].some((tool) => {
     try {
-      execFileSync("command", ["-v", tool])
+      // `command` is a shell builtin, not an executable, so execFileSync on it
+      // throws ENOENT for every tool on every machine. Probe through a real
+      // shell so the detection reflects what the launcher itself can call.
+      execFileSync("sh", ["-c", `command -v ${tool}`])
       return true
     } catch {
       return false
@@ -182,24 +185,15 @@ test("default discovery keeps both layouts of each Playwright revision adjacent,
     WSL_CHROMIUM_CDP_CANDIDATES: undefined,
     WSL_CHROMIUM_CDP_BIN: undefined,
   }
-  // The launcher stops at the first working candidate, so observe the full
-  // order it would have tried in one pass: make every discovered candidate
-  // fail, which forces the whole list to be reported as rejected candidates.
-  for (const browser of candidates) stub(browser, "exit 1")
-  const result = spawnSync(launcher, ["--resolve"], { encoding: "utf8", env: discovered })
-  assert.equal(result.status, 1)
-  const rejected = result.stderr
-    .split("\n")
-    .map((line) => line.match(/^\s+- (.*): (?:not executable|--version probe failed|probe timed out)$/)?.[1])
-    .filter((candidate) => candidate !== undefined && candidate.startsWith(home))
-    .map((candidate) => candidate.slice(home.length + 1))
-  assert.deepEqual(rejected, expected)
-  // With the whole list working, the first entry of the observed order is the
-  // one the launcher resolves, so an ordering regression fails here too.
-  for (const browser of candidates) stub(browser, "exit 0")
-  const resolved = spawnSync(launcher, ["--resolve"], { encoding: "utf8", env: discovered })
-  assert.equal(resolved.status, 0)
-  assert.equal(resolved.stdout.trim(), candidates[0])
+  // Observe the full order through successes that never reach snap: resolve,
+  // kill the winner by rewriting it to exit 1, and repeat. Each run must pick
+  // the next entry of expected, so any ordering regression fails here.
+  for (const expectedWinner of candidates) {
+    const run = spawnSync(launcher, ["--resolve"], { encoding: "utf8", env: discovered })
+    assert.equal(run.status, 0)
+    assert.equal(run.stdout.trim(), expectedWinner)
+    stub(expectedWinner, "exit 1")
+  }
 })
 
 test("a candidate whose probe outlives the timeout is skipped with a timed-out reason", (t) => {
@@ -212,11 +206,18 @@ test("a candidate whose probe outlives the timeout is skipped with a timed-out r
   writeFileSync(slow, "#!/bin/sh\nsleep 30\n")
   chmodSync(slow, 0o755)
   const working = executable("working", 0)
+  // Slow-only run: nothing resolves, so the failure path prints the reason
+  // list, which must name the distinct timed-out reason rather than the
+  // generic probe-failed one.
+  const failed = resolve([slow])
+  assert.equal(failed.status, 1)
+  assert.match(failed.stderr, new RegExp(`${tempDir}/slow: probe timed out`))
+  assert.doesNotMatch(failed.stderr, new RegExp(`${tempDir}/slow: --version probe failed`))
+  // Slow-then-working run: the 30s sleep is killed at the 5s probe cap and
+  // the working candidate wins.
   const result = resolve([slow, working])
   assert.equal(result.status, 0)
   assert.equal(result.stdout.trim(), working)
-  assert.doesNotMatch(result.stderr, new RegExp(`${tempDir}/slow: --version probe failed`))
-  assert.match(result.stderr, new RegExp(`${tempDir}/slow: probe timed out`))
 })
 
 test("an empty candidate override is reported instead of silently falling through", () => {

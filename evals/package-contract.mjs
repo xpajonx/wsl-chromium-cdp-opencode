@@ -42,8 +42,43 @@ assert.match(readme, /WSL_CHROMIUM_CDP_BIN/)
 assert.match(readme, /Snap Chromium does not start under WSL2/)
 assert.match(readme, /Target identity can be stale for up to 500ms/)
 
+// Ordering: Playwright revisions are searched newest first, and inside every
+// revision the 64-bit binary is probed before the 32-bit one.
+assert.match(
+  readme,
+  /probing `chrome-linux64\/chrome` before `chrome-linux\/chrome` inside every revision/,
+)
+
+// Probe timeout: every `--version` probe is bounded when a timeout command exists.
+assert.match(
+  readme,
+  /Each `--version` probe is capped at 5 seconds when `gtimeout` or `timeout` is available/,
+)
+
+// Spaces: the BIN override is passed through whole, never word-split.
+assert.match(
+  readme,
+  /`WSL_CHROMIUM_CDP_BIN`, which is never split/,
+)
+
+// Input cap: wsl_chromium_type refuses payloads past 4000 characters.
+assert.match(readme, /`wsl_chromium_type` accepts at most 4000 characters/)
+
+// Navigate truthfulness: both failure modes are surfaced as errors, not as a
+// fake "Opened URL:" success line.
+assert.match(
+  readme,
+  /neither case is reported as an `Opened URL:` success/,
+)
+
+// Error markers: the exact user-facing failure strings, checked against the
+// README prose that documents the behaviour.
+assert.match(readme, /reports an error when the destination does not settle inside the poll deadline or when the target disappears/)
+assert.match(readme, /Page faults from the read-only tools surface the page's own description instead of the bare word `Uncaught`/)
+assert.match(readme, /a missing result is reported as an empty response rather than a TypeError/)
+
 const launcher = readFileSync(path.join(root, "bin/opencode-chromium-cdp"), "utf8")
 assert.equal(launcher.includes("chromium=/snap/bin/chromium"), false)
 
 execFileSync("sh", ["-n", path.join(root, "bin/opencode-chromium-cdp")], { cwd: root, stdio: "pipe" })
-console.log("Package contract eval passed: export, exact package contents, CDP trust boundary, stale-target window, browser resolution, and launcher syntax.")
+console.log("Package contract eval passed: export, exact package contents, CDP trust boundary, stale-target window, browser resolution and Playwright ordering, input caps, probe timeout, and navigation truthfulness, plus launcher syntax.")
