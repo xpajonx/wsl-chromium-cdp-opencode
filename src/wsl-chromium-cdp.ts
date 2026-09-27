@@ -28,26 +28,48 @@ function boundedFetch(url: string, init?: RequestInit): Promise<Response> {
 
 type TargetsOptions = { maxAgeMs?: number; bypass?: boolean }
 
-let targetCache: { pages: PageTarget[]; fetchedAt: number } | undefined
+// The entry carries the TTL it was written under, not just when it was written. One slot is shared by every
+// reader, so without this a 2000ms list read could inherit an entry written under the 500ms target TTL and
+// serve it for 2000ms, and a 500ms target read could inherit a 2000ms entry. A reader must clear BOTH its own
+// freshness budget and the budget the writer promised.
+type TargetCacheEntry = { pages: PageTarget[]; fetchedAt: number; ttlMs: number }
+
+let targetCache: TargetCacheEntry | undefined
 
 export function invalidateTargetCache(): void {
   targetCache = undefined
 }
 
 export async function targets(options: TargetsOptions = {}): Promise<PageTarget[]> {
-  if (!options.bypass && targetCache && Date.now() - targetCache.fetchedAt < (options.maxAgeMs ?? TARGET_CACHE_MS)) {
-    return targetCache.pages
+  const ttlMs = options.maxAgeMs ?? TARGET_CACHE_MS
+  if (!options.bypass && targetCache) {
+    const age = Date.now() - targetCache.fetchedAt
+    if (age < ttlMs && age < targetCache.ttlMs) return targetCache.pages
   }
   const response = await boundedFetch(`${CDP_HTTP}/json/list`)
   if (!response.ok) throw new Error(`CDP target query failed: HTTP ${response.status}`)
   const data: unknown = await response.json()
   if (!Array.isArray(data)) throw new Error("CDP returned an invalid target list")
-  const pages = data.filter((item): item is PageTarget =>
-    !!item && typeof item === "object" && (item as PageTarget).type === "page" &&
-    typeof (item as PageTarget).id === "string" &&
-    typeof (item as PageTarget).url === "string",
-  )
-  if (!options.bypass) targetCache = { pages, fetchedAt: Date.now() }
+  // title and url are both page-controlled and both are interpolated into tool output, so neither is trusted.
+  // id and url stay hard requirements; a non-string or missing title is normalized to "" rather than leaking
+  // a number, "undefined", or "[object Object]" into every tool result.
+  const pages = data
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .filter((item) => item.type === "page" && typeof item.id === "string" && typeof item.url === "string")
+    .map((item) => ({
+      id: item.id as string,
+      title: typeof item.title === "string" ? item.title : "",
+      url: item.url as string,
+      type: "page",
+      ...(typeof item.webSocketDebuggerUrl === "string" ? { webSocketDebuggerUrl: item.webSocketDebuggerUrl } : {}),
+    }))
+  if (!options.bypass) {
+    // An empty list must not be cached for the full requested TTL (a multi-second poisoned "no targets" entry),
+    // and must not be left uncached either: 127.0.0.1:9222 is the shared request path for all seven tools, so an
+    // uncached empty list permits an unbounded refetch loop. Clamping to the short target TTL bounds the worst
+    // case at roughly two fetches per second.
+    targetCache = { pages, fetchedAt: Date.now(), ttlMs: pages.length === 0 ? Math.min(ttlMs, TARGET_CACHE_MS) : ttlMs }
+  }
   return pages
 }
 
@@ -146,7 +168,7 @@ function selectTarget(all: PageTarget[], targetId?: string): PageTarget {
 }
 
 export async function selectTargetCached(targetId?: string): Promise<PageTarget> {
-  const wasCached = targetCache !== undefined && Date.now() - targetCache.fetchedAt < TARGET_CACHE_MS
+  const wasCached = targetCache !== undefined && Date.now() - targetCache.fetchedAt < Math.min(TARGET_CACHE_MS, targetCache.ttlMs)
   const pages = await targets({ maxAgeMs: TARGET_CACHE_MS })
   try {
     return selectTarget(pages, targetId)
@@ -258,13 +280,17 @@ export default {
         },
         async execute(input: { url: string; target_id?: string }) {
           try {
-            invalidateTargetCache()
             let destination: URL
             if (input.url === "about:blank") destination = new URL("about:blank")
             else {
               destination = new URL(input.url)
               if (destination.protocol !== "http:" && destination.protocol !== "https:") throw new Error("Only http, https, and about:blank URLs are allowed")
             }
+            // Invalidation is deliberately after URL validation and before the fetch. It must precede the fetch
+            // because the fetch re-populates the cache with a pre-navigation list; and it is the only invalidation
+            // covering a selectTarget failure or a WebSocket construction failure, both of which throw before the
+            // session body is entered and would otherwise skip the inner finally.
+            invalidateTargetCache()
             const page = selectTarget(await targets(), input.target_id)
             return await withSession(page, async (session) => {
               try {
@@ -272,10 +298,29 @@ export default {
                 await session.send("Page.navigate", { url: destination.href })
                 const deadline = Date.now() + REQUEST_TIMEOUT_MS
                 let current = page
-                while (Date.now() < deadline) {
+                let settled = current.url === destination.href
+                let missing = 0
+                while (!settled && Date.now() < deadline) {
                   await new Promise((resolve) => setTimeout(resolve, 200))
-                  current = (await targets({ bypass: true })).find((item) => item.id === page.id) ?? page
-                  if (current.url === destination.href) break
+                  const fresh = await targets({ bypass: true })
+                  const next = fresh.find((item) => item.id === page.id)
+                  if (next) {
+                    missing = 0
+                    current = next
+                    settled = current.url === destination.href
+                    continue
+                  }
+                  // A non-empty fresh list without this id is real evidence the target is gone, but Chromium
+                  // reissues target ids on routine navigations such as about:blank to a real URL, so a single
+                  // miss proves nothing: require more than one consecutive miss. An empty list is not evidence
+                  // either, since a blank first tab is a routine non-empty-list case that also returns no match.
+                  if (fresh.length > 0 && missing > 0) {
+                    throw new Error(`Page target with id ${page.id} is no longer present in the CDP target list`)
+                  }
+                  missing += 1
+                }
+                if (!settled) {
+                  throw new Error(`Navigation to ${destination.href} did not settle before the ${REQUEST_TIMEOUT_MS}ms poll deadline`)
                 }
                 const state = await session.send("Runtime.evaluate", {
                   expression: "({url: location.href, title: document.title})",
